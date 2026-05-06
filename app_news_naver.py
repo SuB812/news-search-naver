@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''# app_news_naver_openai_search.py
+# app_news_naver_openai_search.py
 # -------------------------------------------------------------------
 # 네이버 뉴스 API + OpenAI Web Search 뉴스 검색/요약 + Supabase 저장 앱
 #
@@ -767,10 +765,3 @@ with tab3:
 
     except Exception as e:
         st.error(f"통계를 불러오는 중 오류가 발생했습니다: {e}")
-'''
-
-path = Path("/mnt/data/app_news_naver_openai_search_full.py")
-path.write_text(code, encoding="utf-8")
-
-print("created:", path)
-print("lines:", len(code.splitlines()))
