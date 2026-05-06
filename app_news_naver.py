@@ -268,63 +268,120 @@ def summarize_news_with_gpt(title, description):
 # -------------------------------------------------------------------
 # 7. OpenAI Web Search 뉴스 검색 함수
 # -------------------------------------------------------------------
-
 def search_news_with_openai(keyword, result_count):
     """
-    OpenAI Responses API의 Web Search 도구를 사용해 최신 뉴스 검색+요약을 수행합니다.
-    네이버 API, Gemini API, Google Custom Search API를 사용하지 않습니다.
-
-    중요:
-    - 실제 웹 검색으로 확인된 기사만 반환하도록 프롬프트에 명시합니다.
-    - URL이 없는 항목은 저장하지 않습니다.
+    OpenAI Web Search 도구로 실제 뉴스 검색 후,
+    검색 결과를 다시 JSON 배열로 정리합니다.
     """
 
-    prompt = f"""
-당신은 뉴스 큐레이션 전문가입니다.
+    # ------------------------------------------------------------
+    # 1단계: OpenAI Web Search로 실제 기사 검색
+    # ------------------------------------------------------------
+    search_prompt = f"""
+당신은 뉴스 리서처입니다.
 
 아래 키워드와 관련된 최신 뉴스 기사 {result_count}건을 웹 검색으로 찾아주세요.
 
 키워드: "{keyword}"
 
 매우 중요한 규칙:
-- 반드시 웹 검색 도구로 실제 존재하는 기사만 찾아야 합니다.
+- 반드시 웹 검색 도구로 실제 존재하는 기사만 찾으세요.
 - 절대 기사를 지어내면 안 됩니다.
-- title, source, news_date, url은 검색 결과에서 확인 가능한 정보만 사용하세요.
-- url은 실제 기사 원문 URL이어야 합니다.
-- 검색 결과 페이지 URL, 포털 검색 결과 URL, 임의 URL은 금지합니다.
-- 실제 URL을 확인하지 못한 기사는 결과에 포함하지 마세요.
-- 날짜를 확실히 알 수 없으면 news_date는 빈 문자열 ""로 두세요.
-- source는 언론사명 또는 사이트명을 적으세요.
-- summary는 해당 기사 내용을 근거로 한국어 3~4문장으로 작성하세요.
-- 응답은 반드시 JSON 배열만 출력하세요. 설명, 인사말, 코드블록은 절대 포함하지 마세요.
-
-JSON 형식:
-[
-  {{
-    "title": "기사 제목",
-    "source": "언론사 이름 또는 사이트명",
-    "news_date": "YYYY-MM-DD",
-    "url": "https://원본기사주소",
-    "summary": "기사 핵심 내용을 한국어 3~4문장으로 요약"
-  }}
-]
+- 각 기사마다 제목, 언론사/사이트명, 날짜, 원문 URL, 핵심 내용을 포함하세요.
+- 실제 원문 URL을 확인하지 못한 기사는 제외하세요.
+- 검색 결과 페이지 URL이 아니라 실제 기사 원문 URL이어야 합니다.
+- 한국어로 정리하세요.
 """
 
-    # web_search_preview는 일부 계정/모델에서 아직 쓰이는 웹검색 도구명입니다.
-    # 계정에서 최신 web_search만 허용하는 경우 아래 type을 "web_search"로 바꾸면 됩니다.
-    response = openai_client.responses.create(
+    search_response = openai_client.responses.create(
         model="gpt-4.1-mini",
         tools=[
             {
                 "type": "web_search_preview"
             }
         ],
-        input=prompt,
-        temperature=0.2
+        input=search_prompt,
     )
 
-    raw_text = response.output_text or ""
-    news_data = extract_json_array(raw_text)
+    search_text = search_response.output_text or ""
+
+    # 디버깅용: OpenAI가 실제로 뭐라고 답했는지 확인 가능
+    with st.expander("OpenAI Search 원본 응답 확인"):
+        st.write(search_text)
+
+    # ------------------------------------------------------------
+    # 2단계: 검색 결과 텍스트를 JSON 배열로 변환
+    # ------------------------------------------------------------
+json_prompt = f"""
+아래는 웹 검색으로 확인한 실제 뉴스 검색 결과입니다.
+
+이 텍스트에 포함된 기사만 사용해서 JSON으로 변환하세요.
+텍스트에 없는 기사는 절대 추가하지 마세요.
+URL이 없는 항목은 제외하세요.
+
+검색 키워드: "{keyword}"
+요청 기사 수: {result_count}
+
+웹 검색 결과:
+{search_text}
+
+반드시 아래 JSON 객체 형식으로만 응답하세요.
+설명, 인사말, 코드블록은 절대 포함하지 마세요.
+
+{{
+  "articles": [
+    {{
+      "title": "기사 제목",
+      "source": "언론사 이름 또는 사이트명",
+      "news_date": "YYYY-MM-DD",
+      "url": "https://원본기사주소",
+      "summary": "기사 핵심 내용을 한국어 3~4문장으로 요약"
+    }}
+  ]
+}}
+
+규칙:
+- 실제 검색 결과에 포함된 기사만 변환하세요.
+- title, source, url은 검색 결과에 있는 정보만 사용하세요.
+- url이 없으면 해당 기사는 제외하세요.
+- news_date를 알 수 없으면 ""로 두세요.
+- summary는 검색 결과 내용을 근거로만 작성하세요.
+- JSON 객체 외 텍스트는 절대 출력하지 마세요.
+"""
+
+    json_response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": json_prompt
+            }
+        ],
+        temperature=0.1,
+        response_format={
+            "type": "json_object"
+        }
+    )
+
+    json_text = json_response.choices[0].message.content or ""
+
+    # json_object 모드에서는 보통 {"articles": [...]} 형태가 더 안정적이라 보정
+    parsed = json.loads(json_text)
+
+    if isinstance(parsed, dict):
+        if "articles" in parsed:
+            news_data = parsed["articles"]
+        else:
+            # 혹시 다른 key로 들어온 경우 첫 번째 list 값을 사용
+            news_data = []
+            for value in parsed.values():
+                if isinstance(value, list):
+                    news_data = value
+                    break
+    elif isinstance(parsed, list):
+        news_data = parsed
+    else:
+        news_data = []
 
     results = []
 
