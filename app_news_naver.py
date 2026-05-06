@@ -268,10 +268,13 @@ def summarize_news_with_gpt(title, description):
 # -------------------------------------------------------------------
 # 7. OpenAI Web Search 뉴스 검색 함수
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
+# 7. OpenAI Web Search 뉴스 검색 함수
+# -------------------------------------------------------------------
 def search_news_with_openai(keyword, result_count):
     """
     OpenAI Web Search 도구로 실제 뉴스 검색 후,
-    검색 결과를 다시 JSON 배열로 정리합니다.
+    검색 결과를 다시 JSON 객체로 정리합니다.
     """
 
     # ------------------------------------------------------------
@@ -310,9 +313,9 @@ def search_news_with_openai(keyword, result_count):
         st.write(search_text)
 
     # ------------------------------------------------------------
-    # 2단계: 검색 결과 텍스트를 JSON 배열로 변환
+    # 2단계: 검색 결과 텍스트를 JSON 객체로 변환
     # ------------------------------------------------------------
-json_prompt = f"""
+    json_prompt = f"""
 아래는 웹 검색으로 확인한 실제 뉴스 검색 결과입니다.
 
 이 텍스트에 포함된 기사만 사용해서 JSON으로 변환하세요.
@@ -365,14 +368,12 @@ URL이 없는 항목은 제외하세요.
 
     json_text = json_response.choices[0].message.content or ""
 
-    # json_object 모드에서는 보통 {"articles": [...]} 형태가 더 안정적이라 보정
     parsed = json.loads(json_text)
 
     if isinstance(parsed, dict):
         if "articles" in parsed:
             news_data = parsed["articles"]
         else:
-            # 혹시 다른 key로 들어온 경우 첫 번째 list 값을 사용
             news_data = []
             for value in parsed.values():
                 if isinstance(value, list):
@@ -402,8 +403,6 @@ URL이 없는 항목은 제외하세요.
             results.append(item)
 
     return results
-
-
 # -------------------------------------------------------------------
 # 8. Supabase 조회 함수
 # -------------------------------------------------------------------
