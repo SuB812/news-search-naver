@@ -1,6 +1,15 @@
-# app_news_naver_gemini.py
+from pathlib import Path
+
+code = r'''# app_news_naver_openai_search.py
 # -------------------------------------------------------------------
-# 네이버 뉴스 API + Gemini Google Search Grounding 뉴스 검색/요약 앱
+# 네이버 뉴스 API + OpenAI Web Search 뉴스 검색/요약 + Supabase 저장 앱
+#
+# 핵심:
+# 1) 네이버 검색: Naver News Open API로 기사 검색 → GPT로 요약
+# 2) OpenAI 검색: OpenAI Responses API의 Web Search 도구로 실제 웹 기사 검색+요약
+# 3) 절대 임의 기사 생성 금지: OpenAI 프롬프트에서 "실제 검색으로 확인된 기사만" 요구
+# 4) 뉴스 출처(source), 원문 URL(url), 날짜(news_date), 요약(summary) 저장
+# 5) Supabase 테이블 분리 저장
 #
 # requirements.txt:
 # streamlit
@@ -8,13 +17,11 @@
 # requests
 # openai
 # supabase
-# google-genai
 #
-# Streamlit Secrets:
+# Streamlit Cloud Secrets 예시:
 # OPENAI_API_KEY = "sk-..."
 # NAVER_CLIENT_ID = "네이버_CLIENT_ID"
 # NAVER_CLIENT_SECRET = "네이버_CLIENT_SECRET"
-# GEMINI_API_KEY = "제미나이_API_KEY"
 # SUPABASE_URL = "https://xxxx.supabase.co"
 # SUPABASE_KEY = "supabase_anon_or_service_role_key"
 # -------------------------------------------------------------------
@@ -22,14 +29,13 @@
 import json
 import re
 import html
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
 import streamlit as st
 from openai import OpenAI
 from supabase import create_client, Client
-from google import genai
-from google.genai import types
 
 
 # -------------------------------------------------------------------
@@ -37,7 +43,7 @@ from google.genai import types
 # -------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="최신 뉴스 검색 및 저장 앱",
+    page_title="뉴스 검색 및 저장 앱",
     page_icon="📰",
     layout="wide"
 )
@@ -52,8 +58,6 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
 NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
 
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
@@ -63,23 +67,17 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 # -------------------------------------------------------------------
 
 @st.cache_resource
-def init_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-@st.cache_resource
 def init_openai_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
 
 @st.cache_resource
-def init_gemini_client():
-    return genai.Client(api_key=GEMINI_API_KEY)
+def init_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-supabase = init_supabase()
 openai_client = init_openai_client()
-gemini_client = init_gemini_client()
+supabase = init_supabase()
 
 
 # -------------------------------------------------------------------
@@ -100,15 +98,27 @@ def clean_text(text):
     return text
 
 
+def normalize_naver_date(pub_date):
+    """네이버 pubDate 문자열을 YYYY-MM-DD 형태로 변환합니다."""
+    if not pub_date:
+        return ""
+
+    try:
+        dt = parsedate_to_datetime(pub_date)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return pub_date
+
+
 def get_table_name(search_engine):
-    """검색 엔진에 따라 저장할 Supabase 테이블명을 반환합니다."""
+    """검색 방식에 따라 저장할 Supabase 테이블명을 반환합니다."""
     if search_engine == "네이버":
         return "naver_news_history"
 
-    if search_engine == "제미나이":
-        return "gemini_news_history"
+    if search_engine == "OpenAI Search":
+        return "openai_news_history"
 
-    return "naver_news_history"
+    return "openai_news_history"
 
 
 def extract_json_array(text):
@@ -137,8 +147,28 @@ def extract_json_array(text):
     return data
 
 
+def is_valid_article_item(item):
+    """
+    기사 데이터가 최소 조건을 만족하는지 확인합니다.
+    title과 url이 없으면 저장하지 않습니다.
+    """
+    title = clean_text(item.get("title", ""))
+    url = clean_text(item.get("url", ""))
+
+    if not title:
+        return False
+
+    if not url:
+        return False
+
+    if not url.startswith("http"):
+        return False
+
+    return True
+
+
 def save_news_to_supabase(search_engine, db_data):
-    """검색 엔진에 따라 다른 Supabase 테이블에 저장합니다."""
+    """검색 방식에 따라 다른 Supabase 테이블에 저장합니다."""
     table_name = get_table_name(search_engine)
 
     try:
@@ -160,8 +190,8 @@ def save_news_to_supabase(search_engine, db_data):
 # 5. 네이버 뉴스 검색 함수
 # -------------------------------------------------------------------
 
-def get_naver_news(query):
-    """네이버 API를 통해 최신 뉴스 3개를 가져옵니다."""
+def get_naver_news(query, display_count):
+    """네이버 API를 통해 최신 뉴스를 가져옵니다."""
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -171,7 +201,7 @@ def get_naver_news(query):
 
     params = {
         "query": query,
-        "display": 3,
+        "display": display_count,
         "sort": "date"
     }
 
@@ -188,12 +218,18 @@ def get_naver_news(query):
         results = []
 
         for item in items:
+            title = clean_text(item.get("title", ""))
+            description = clean_text(item.get("description", ""))
+            link = item.get("originallink") or item.get("link", "")
+            pub_date = normalize_naver_date(item.get("pubDate", ""))
+
             results.append({
-                "title": clean_text(item.get("title", "")),
-                "description": clean_text(item.get("description", "")),
-                "link": item.get("link", ""),
-                "pubDate": item.get("pubDate", ""),
-                "source": "Naver News"
+                "title": title,
+                "source": "Naver News",
+                "news_date": pub_date,
+                "url": link,
+                "description": description,
+                "summary": ""
             })
 
         return results
@@ -204,13 +240,14 @@ def get_naver_news(query):
 
 
 # -------------------------------------------------------------------
-# 6. OpenAI GPT 요약 함수
+# 6. 네이버 기사 GPT 요약 함수
 # -------------------------------------------------------------------
 
 def summarize_news_with_gpt(title, description):
-    """GPT를 사용하여 뉴스 내용을 2문장으로 요약합니다."""
+    """네이버 API가 가져온 제목/설명을 GPT로 요약합니다."""
     prompt = f"""
 다음 뉴스 제목과 내용을 바탕으로 핵심만 한국어 2문장 내외로 요약해줘.
+추측하지 말고, 제공된 제목과 내용 안에서만 요약해줘.
 
 제목: {title}
 내용: {description}
@@ -224,89 +261,96 @@ def summarize_news_with_gpt(title, description):
                 "content": prompt
             }
         ],
-        temperature=0.5
+        temperature=0.2
     )
 
     return response.choices[0].message.content.strip()
 
 
 # -------------------------------------------------------------------
-# 7. Gemini Google Search Grounding 검색 함수
+# 7. OpenAI Web Search 뉴스 검색 함수
 # -------------------------------------------------------------------
 
-def get_gemini_news(query):
+def search_news_with_openai(keyword, result_count):
     """
-    Gemini Google Search Grounding을 통해 최신 뉴스 3개를 가져옵니다.
-    GOOGLE_API_KEY / GOOGLE_CX는 필요 없습니다.
-    GEMINI_API_KEY만 사용합니다.
+    OpenAI Responses API의 Web Search 도구를 사용해 최신 뉴스 검색+요약을 수행합니다.
+    네이버 API, Gemini API, Google Custom Search API를 사용하지 않습니다.
+
+    중요:
+    - 실제 웹 검색으로 확인된 기사만 반환하도록 프롬프트에 명시합니다.
+    - URL이 없는 항목은 저장하지 않습니다.
     """
 
     prompt = f"""
 당신은 뉴스 큐레이션 전문가입니다.
 
-아래 키워드와 관련된 최신 한국어 뉴스 기사 3건을 Google Search를 사용해 찾아주세요.
+아래 키워드와 관련된 최신 뉴스 기사 {result_count}건을 웹 검색으로 찾아주세요.
 
-키워드: "{query}"
+키워드: "{keyword}"
 
-각 기사에 대해 다음 정보를 JSON 배열 형식으로만 응답하세요.
-설명, 인사말, 머리말, 코드블록(```)은 절대 포함하지 마세요.
-응답은 반드시 [ ... ] 로 시작하고 끝나는 순수 JSON 배열이어야 합니다.
+매우 중요한 규칙:
+- 반드시 웹 검색 도구로 실제 존재하는 기사만 찾아야 합니다.
+- 절대 기사를 지어내면 안 됩니다.
+- title, source, news_date, url은 검색 결과에서 확인 가능한 정보만 사용하세요.
+- url은 실제 기사 원문 URL이어야 합니다.
+- 검색 결과 페이지 URL, 포털 검색 결과 URL, 임의 URL은 금지합니다.
+- 실제 URL을 확인하지 못한 기사는 결과에 포함하지 마세요.
+- 날짜를 확실히 알 수 없으면 news_date는 빈 문자열 ""로 두세요.
+- source는 언론사명 또는 사이트명을 적으세요.
+- summary는 해당 기사 내용을 근거로 한국어 3~4문장으로 작성하세요.
+- 응답은 반드시 JSON 배열만 출력하세요. 설명, 인사말, 코드블록은 절대 포함하지 마세요.
 
 JSON 형식:
 [
   {{
     "title": "기사 제목",
-    "source": "언론사 이름",
-    "news_date": "2026-05-06",
+    "source": "언론사 이름 또는 사이트명",
+    "news_date": "YYYY-MM-DD",
     "url": "https://원본기사주소",
     "summary": "기사 핵심 내용을 한국어 3~4문장으로 요약"
   }}
 ]
-
-규칙:
-- 정확히 3건을 반환하세요.
-- 가능한 한 최신 기사 위주로 선택하세요.
-- url은 실제 기사 원문 URL이어야 합니다.
-- 구글 검색 결과 페이지 URL은 금지합니다.
-- news_date는 YYYY-MM-DD 형식으로 작성하세요.
-- source는 언론사 이름으로 작성하세요.
-- summary는 한국어 3~4문장으로 작성하세요.
-- JSON 배열 외 텍스트는 절대 출력하지 마세요.
 """
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[
-                {
-                    "google_search": {}
-                }
-            ],
-            temperature=0.2
-        )
+    # web_search_preview는 일부 계정/모델에서 아직 쓰이는 웹검색 도구명입니다.
+    # 계정에서 최신 web_search만 허용하는 경우 아래 type을 "web_search"로 바꾸면 됩니다.
+    response = openai_client.responses.create(
+        model="gpt-4.1-mini",
+        tools=[
+            {
+                "type": "web_search_preview"
+            }
+        ],
+        input=prompt,
+        temperature=0.2
     )
 
-    raw_text = response.text or ""
+    raw_text = response.output_text or ""
     news_data = extract_json_array(raw_text)
 
     results = []
 
     for news in news_data:
-        results.append({
+        if not isinstance(news, dict):
+            continue
+
+        item = {
             "title": clean_text(news.get("title", "")),
+            "source": clean_text(news.get("source", "OpenAI Web Search")),
+            "news_date": clean_text(news.get("news_date", "")),
+            "url": clean_text(news.get("url", "")),
             "description": clean_text(news.get("summary", "")),
-            "link": news.get("url", ""),
-            "pubDate": news.get("news_date", ""),
-            "source": clean_text(news.get("source", "Gemini Google Search")),
             "summary": clean_text(news.get("summary", ""))
-        })
+        }
+
+        if is_valid_article_item(item):
+            results.append(item)
 
     return results
 
 
 # -------------------------------------------------------------------
-# 8. 데이터 조회 함수
+# 8. Supabase 조회 함수
 # -------------------------------------------------------------------
 
 def load_table_data(table_name):
@@ -323,25 +367,25 @@ def load_table_data(table_name):
 
 
 def load_all_news_data():
-    """네이버/제미나이 테이블을 모두 불러와 하나의 DataFrame으로 합칩니다."""
+    """네이버/OpenAI 테이블을 모두 불러와 하나의 DataFrame으로 합칩니다."""
     naver_data = load_table_data("naver_news_history")
-    gemini_data = load_table_data("gemini_news_history")
+    openai_data = load_table_data("openai_news_history")
 
     naver_df = pd.DataFrame(naver_data)
-    gemini_df = pd.DataFrame(gemini_data)
+    openai_df = pd.DataFrame(openai_data)
 
     if not naver_df.empty:
         naver_df["search_engine"] = "네이버"
 
-    if not gemini_df.empty:
-        gemini_df["search_engine"] = "제미나이"
+    if not openai_df.empty:
+        openai_df["search_engine"] = "OpenAI Search"
 
     df_all = pd.concat(
-        [naver_df, gemini_df],
+        [naver_df, openai_df],
         ignore_index=True
     )
 
-    return df_all, naver_df, gemini_df
+    return df_all, naver_df, openai_df
 
 
 # -------------------------------------------------------------------
@@ -350,8 +394,8 @@ def load_all_news_data():
 
 st.title("📰 AI 최신 뉴스 검색 & 자동 저장기")
 st.info(
-    "💡 네이버 API 검색과 Gemini Google Search Grounding 검색을 함께 사용합니다. "
-    "검색 결과는 Supabase DB에 자동 저장됩니다."
+    "💡 검색 방식: 네이버 뉴스 API 또는 OpenAI Web Search. "
+    "검색된 기사 원문 URL과 출처를 함께 저장합니다."
 )
 
 tab1, tab2, tab3 = st.tabs([
@@ -370,13 +414,19 @@ with tab1:
 
     search_engine = st.radio(
         "검색 방식을 선택하세요",
-        ["네이버", "제미나이"],
+        ["네이버", "OpenAI Search"],
         horizontal=True
     )
 
     keyword = st.text_input(
         "검색할 뉴스 키워드를 입력하세요",
         placeholder="예: 삼성전자, 생성형 AI, 테슬라, ESG"
+    )
+
+    result_count = st.selectbox(
+        "가져올 기사 수",
+        [3, 5, 10],
+        index=0
     )
 
     if st.button("뉴스 검색 및 자동 저장", type="primary"):
@@ -386,12 +436,18 @@ with tab1:
             st.warning("키워드를 입력해주세요!")
 
         else:
-            with st.spinner(f"{search_engine}에서 최신 뉴스를 검색하고 DB에 저장하는 중입니다..."):
+            with st.spinner(f"{search_engine}로 최신 뉴스를 검색하고 DB에 저장하는 중입니다..."):
                 try:
                     if search_engine == "네이버":
-                        news_items = get_naver_news(keyword_clean)
+                        news_items = get_naver_news(
+                            query=keyword_clean,
+                            display_count=result_count
+                        )
                     else:
-                        news_items = get_gemini_news(keyword_clean)
+                        news_items = search_news_with_openai(
+                            keyword=keyword_clean,
+                            result_count=result_count
+                        )
 
                     if not news_items:
                         st.error("뉴스 결과를 가져오지 못했습니다.")
@@ -399,40 +455,25 @@ with tab1:
                     else:
                         saved_count = 0
                         duplicate_count = 0
+                        skipped_count = 0
 
                         st.success(f"'{keyword_clean}'에 대한 검색이 완료되었습니다!")
 
                         for news in news_items:
                             title = clean_text(news.get("title", ""))
                             source = clean_text(news.get("source", search_engine))
-                            news_date = news.get("pubDate", "")
-                            url = news.get("link", "")
+                            news_date = clean_text(news.get("news_date", ""))
+                            url = clean_text(news.get("url", ""))
                             description = clean_text(news.get("description", ""))
 
-                            # 네이버는 GPT로 요약, 제미나이는 이미 summary가 있으므로 그대로 사용
                             if search_engine == "네이버":
                                 summary = summarize_news_with_gpt(
                                     title,
                                     description
                                 )
                             else:
-                                summary = clean_text(news.get("summary", description))
+                                summary = clean_text(news.get("summary", ""))
 
-                            # 화면 출력
-                            with st.container(border=True):
-                                if url:
-                                    st.markdown(f"#### [{title}]({url})")
-                                else:
-                                    st.markdown(f"#### {title}")
-
-                                st.caption(
-                                    f"🏢 **출처:** {source} | "
-                                    f"📅 **날짜:** {news_date} | "
-                                    f"🔎 **검색:** {search_engine}"
-                                )
-                                st.write(summary)
-
-                            # DB 저장 데이터
                             db_record = {
                                 "keyword": keyword_clean,
                                 "title": title,
@@ -441,6 +482,21 @@ with tab1:
                                 "url": url,
                                 "summary": summary
                             }
+
+                            # 최소 조건 검증: 제목과 실제 URL 없으면 표시/저장하지 않음
+                            if not is_valid_article_item(db_record):
+                                skipped_count += 1
+                                continue
+
+                            # 화면 출력
+                            with st.container(border=True):
+                                st.markdown(f"#### [{title}]({url})")
+                                st.caption(
+                                    f"🏢 **출처:** {source} | "
+                                    f"📅 **날짜:** {news_date} | "
+                                    f"🔎 **검색:** {search_engine}"
+                                )
+                                st.write(summary)
 
                             saved = save_news_to_supabase(
                                 search_engine,
@@ -454,7 +510,8 @@ with tab1:
 
                         st.toast(
                             f"✅ 새로 저장됨: {saved_count}건 | "
-                            f"🔄 중복/실패 생략됨: {duplicate_count}건"
+                            f"🔄 중복/실패 생략됨: {duplicate_count}건 | "
+                            f"⚠️ URL 없는 항목 제외: {skipped_count}건"
                         )
 
                 except Exception as e:
@@ -470,7 +527,7 @@ with tab2:
 
     saved_engine = st.radio(
         "조회할 저장 목록을 선택하세요",
-        ["네이버", "제미나이", "전체"],
+        ["네이버", "OpenAI Search", "전체"],
         horizontal=True
     )
 
@@ -518,6 +575,7 @@ with tab2:
                 "source",
                 "news_date",
                 "url",
+                "summary",
                 "created_at"
             ]
 
@@ -553,7 +611,7 @@ with tab3:
     st.subheader("검색 통계 대시보드")
 
     try:
-        df_all, naver_df, gemini_df = load_all_news_data()
+        df_all, naver_df, openai_df = load_all_news_data()
 
         if df_all.empty:
             st.info("통계를 표시할 데이터가 부족합니다.")
@@ -566,7 +624,7 @@ with tab3:
 
             total_count = len(df_all)
             naver_count = len(naver_df)
-            gemini_count = len(gemini_df)
+            openai_count = len(openai_df)
             unique_keyword_count = df_all["keyword"].nunique()
             unique_source_count = df_all["source"].nunique()
 
@@ -574,7 +632,7 @@ with tab3:
 
             col1.metric("전체 저장 기사 수", total_count)
             col2.metric("네이버 기사 수", naver_count)
-            col3.metric("제미나이 기사 수", gemini_count)
+            col3.metric("OpenAI Search 기사 수", openai_count)
             col4.metric("검색 키워드 수", unique_keyword_count)
             col5.metric("출처 수", unique_source_count)
 
@@ -709,3 +767,10 @@ with tab3:
 
     except Exception as e:
         st.error(f"통계를 불러오는 중 오류가 발생했습니다: {e}")
+'''
+
+path = Path("/mnt/data/app_news_naver_openai_search_full.py")
+path.write_text(code, encoding="utf-8")
+
+print("created:", path)
+print("lines:", len(code.splitlines()))
